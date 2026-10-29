@@ -1,15 +1,18 @@
+#include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <avr/pgmspace.h>
+#include <Adafruit_BLE.h>
+#include <Adafruit_BluefruitLE_SPI.h>
 
 // --- watchX 硬體腳位定義 ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-
+#define OLED_CS    A5
 #define OLED_DC    A3
 #define OLED_RESET A4
-#define OLED_CS    A5
+
+#define BLE_CS     A2
+#define BLE_IRQ    0
+#define BLE_RST    A1
 
 #define SW1 8   // 按鍵 1 (待機時進 Menu，Menu 內為確認/切換)
 #define SW2 11  // 按鍵 2 (Menu 內為「上」，待機時為戳一下)
@@ -23,14 +26,210 @@
 #define BATTERY_READ  A11  // 電池電壓類比讀取腳位
 #define CHARGE_STATUS 5    // 充電狀態檢測腳位 (LOW 為充電中)
 
-// OLED 顯示實例 (硬體 SPI)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, OLED_DC, OLED_RESET, OLED_CS);
+// 藍牙實例 (硬體 SPI)
+Adafruit_BluefruitLE_SPI ble(BLE_CS, BLE_IRQ, BLE_RST);
+bool bleHardwareReady = false;
+
+// --- 自建 1KB 極簡 OLED 顯存 (大幅節省 12KB+ Flash) ---
+uint8_t oled_buf[1024];
+
+inline void drawPixel(int x, int y, uint8_t color) {
+  if (x < 0 || x >= 128 || y < 0 || y >= 64) return;
+  if (color) oled_buf[x + (y >> 3) * 128] |= (1 << (y & 7));
+  else       oled_buf[x + (y >> 3) * 128] &= ~(1 << (y & 7));
+}
+
+void clearDisplay() {
+  memset(oled_buf, 0, 1024);
+}
+
+void drawFastHLine(int x, int y, int w, uint8_t color) {
+  if (y < 0 || y >= 64 || x >= 128 || w <= 0) return;
+  int x2 = min(128, x + w);
+  for (int i = max(0, x); i < x2; i++) drawPixel(i, y, color);
+}
+
+void drawFastVLine(int x, int y, int h, uint8_t color) {
+  if (x < 0 || x >= 128 || y >= 64 || h <= 0) return;
+  int y2 = min(64, y + h);
+  for (int i = max(0, y); i < y2; i++) drawPixel(x, i, color);
+}
+
+void fillRect(int x, int y, int w, int h, uint8_t color) {
+  for (int i = 0; i < h; i++) drawFastHLine(x, y + i, w, color);
+}
+
+void fillRoundRect(int x, int y, int w, int h, int r, uint8_t color) {
+  fillRect(x + r, y, w - 2 * r, h, color);
+  for (int i = 0; i <= r; i++) {
+    int dx = r - (int)sqrt((long)r * r - (long)(r - i) * (r - i));
+    drawFastHLine(x + dx, y + i, w - 2 * dx, color);
+    drawFastHLine(x + dx, y + h - 1 - i, w - 2 * dx, color);
+  }
+}
+
+void fillCircle(int cx, int cy, int r, uint8_t color) {
+  for (int dy = -r; dy <= r; dy++) {
+    int dx = (int)sqrt((long)r * r - (long)dy * dy);
+    drawFastHLine(cx - dx, cy + dy, 2 * dx + 1, color);
+  }
+}
+
+void drawLine(int x0, int y0, int x1, int y1, uint8_t color) {
+  int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy, e2;
+  while (true) {
+    drawPixel(x0, y0, color);
+    if (x0 == x1 && y0 == y1) break;
+    e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+
+// 5x7 極簡字庫 (ASCII 32 ' ' 到 93 ']')
+static const uint8_t font5x7[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00, // 32 ' '
+  0x00,0x00,0x5F,0x00,0x00, // 33 '!'
+  0x00,0x07,0x00,0x07,0x00, // 34 '"'
+  0x14,0x7F,0x14,0x7F,0x14, // 35 '#'
+  0x24,0x2A,0x7F,0x2A,0x12, // 36 '$'
+  0x23,0x13,0x08,0x64,0x62, // 37 '%'
+  0x36,0x49,0x55,0x22,0x50, // 38 '&'
+  0x00,0x05,0x03,0x00,0x00, // 39 '''
+  0x00,0x1C,0x22,0x41,0x00, // 40 '('
+  0x00,0x41,0x22,0x1C,0x00, // 41 ')'
+  0x14,0x08,0x3E,0x08,0x14, // 42 '*'
+  0x08,0x08,0x3E,0x08,0x08, // 43 '+'
+  0x00,0x50,0x30,0x00,0x00, // 44 ','
+  0x08,0x08,0x08,0x08,0x08, // 45 '-'
+  0x00,0x60,0x60,0x00,0x00, // 46 '.'
+  0x20,0x10,0x08,0x04,0x02, // 47 '/'
+  0x3E,0x51,0x49,0x45,0x3E, // 48 '0'
+  0x00,0x42,0x7F,0x40,0x00, // 49 '1'
+  0x42,0x61,0x51,0x49,0x46, // 50 '2'
+  0x21,0x41,0x45,0x4B,0x31, // 51 '3'
+  0x18,0x14,0x12,0x7F,0x10, // 52 '4'
+  0x27,0x45,0x45,0x45,0x39, // 53 '5'
+  0x3C,0x4A,0x49,0x49,0x30, // 54 '6'
+  0x01,0x71,0x09,0x05,0x03, // 55 '7'
+  0x36,0x49,0x49,0x49,0x36, // 56 '8'
+  0x06,0x49,0x49,0x29,0x1E, // 57 '9'
+  0x00,0x36,0x36,0x00,0x00, // 58 ':'
+  0x00,0x56,0x36,0x00,0x00, // 59 ';'
+  0x08,0x14,0x22,0x41,0x00, // 60 '<'
+  0x14,0x14,0x14,0x14,0x14, // 61 '='
+  0x00,0x41,0x22,0x14,0x08, // 62 '>'
+  0x02,0x01,0x51,0x09,0x06, // 63 '?'
+  0x32,0x49,0x79,0x41,0x3E, // 64 '@'
+  0x7E,0x11,0x11,0x11,0x7E, // 65 'A'
+  0x7F,0x49,0x49,0x49,0x36, // 66 'B'
+  0x3E,0x41,0x41,0x41,0x22, // 67 'C'
+  0x7F,0x41,0x41,0x22,0x1C, // 68 'D'
+  0x7F,0x49,0x49,0x49,0x41, // 69 'E'
+  0x7F,0x09,0x09,0x09,0x01, // 70 'F'
+  0x3E,0x41,0x49,0x49,0x7A, // 71 'G'
+  0x7F,0x08,0x08,0x08,0x7F, // 72 'H'
+  0x00,0x41,0x7F,0x41,0x00, // 73 'I'
+  0x20,0x40,0x41,0x3F,0x01, // 74 'J'
+  0x7F,0x08,0x14,0x22,0x41, // 75 'K'
+  0x7F,0x40,0x40,0x40,0x40, // 76 'L'
+  0x7F,0x02,0x0C,0x02,0x7F, // 77 'M'
+  0x7F,0x04,0x08,0x10,0x7F, // 78 'N'
+  0x3E,0x41,0x41,0x41,0x3E, // 79 'O'
+  0x7F,0x09,0x09,0x09,0x06, // 80 'P'
+  0x3E,0x41,0x51,0x21,0x5E, // 81 'Q'
+  0x7F,0x09,0x19,0x29,0x46, // 82 'R'
+  0x46,0x49,0x49,0x49,0x31, // 83 'S'
+  0x01,0x01,0x7F,0x01,0x01, // 84 'T'
+  0x3F,0x40,0x40,0x40,0x3F, // 85 'U'
+  0x1F,0x20,0x40,0x20,0x1F, // 86 'V'
+  0x7F,0x20,0x18,0x20,0x7F, // 87 'W'
+  0x63,0x14,0x08,0x14,0x63, // 88 'X'
+  0x07,0x08,0x70,0x08,0x07, // 89 'Y'
+  0x61,0x51,0x49,0x45,0x43, // 90 'Z'
+  0x00,0x7F,0x41,0x41,0x00, // 91 '['
+  0x02,0x04,0x08,0x10,0x20, // 92 '\'
+  0x00,0x41,0x41,0x7F,0x00  // 93 ']'
+};
+
+void drawChar(int x, int y, char c, uint8_t color) {
+  if (c >= 'a' && c <= 'z') c -= 32;
+  if (c < 32 || c > 93) return;
+  int offset = (c - 32) * 5;
+  for (int col = 0; col < 5; col++) {
+    uint8_t line = pgm_read_byte(&font5x7[offset + col]);
+    for (int row = 0; row < 7; row++) {
+      if (line & (1 << row)) {
+        drawPixel(x + col, y + row, color);
+      }
+    }
+  }
+}
+
+void drawText(int x, int y, const char *str, uint8_t color) {
+  int curX = x;
+  while (*str) {
+    drawChar(curX, y, *str++, color);
+    curX += 6;
+  }
+}
+
+void drawText_P(int x, int y, const char *pstr, uint8_t color) {
+  int curX = x;
+  char c;
+  while ((c = pgm_read_byte(pstr++))) {
+    drawChar(curX, y, c, color);
+    curX += 6;
+  }
+}
+
+void drawNum(int x, int y, int num, uint8_t color) {
+  char buf[8];
+  itoa(num, buf, 10);
+  drawText(x, y, buf, color);
+}
+
+// --- OLED 硬體初始化與畫面推送 ---
+void oled_init() {
+  pinMode(OLED_CS, OUTPUT);
+  pinMode(OLED_DC, OUTPUT);
+  pinMode(OLED_RESET, OUTPUT);
+  digitalWrite(OLED_RESET, LOW); delay(10);
+  digitalWrite(OLED_RESET, HIGH); delay(10);
+  SPI.begin();
+
+  digitalWrite(OLED_CS, LOW);
+  digitalWrite(OLED_DC, LOW);
+  static const uint8_t PROGMEM initData[] = {
+    0xAE, 0x20, 0x00, 0xC8, 0x40, 0x81, 0xFF, 0xA1,
+    0xA6, 0xA8, 63,   0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12,
+    0xDB, 0x40, 0x8D, 0x14, 0xAF
+  };
+  for (uint8_t i = 0; i < sizeof(initData); i++) {
+    SPI.transfer(pgm_read_byte(&initData[i]));
+  }
+  digitalWrite(OLED_CS, HIGH);
+}
+
+void oled_display() {
+  digitalWrite(OLED_CS, LOW);
+  digitalWrite(OLED_DC, LOW);
+  SPI.transfer(0x21); SPI.transfer(0); SPI.transfer(127);
+  SPI.transfer(0x22); SPI.transfer(0); SPI.transfer(7);
+  digitalWrite(OLED_DC, HIGH);
+  for (uint16_t i = 0; i < 1024; i++) {
+    SPI.transfer(oled_buf[i]);
+  }
+  digitalWrite(OLED_CS, HIGH);
+}
 
 // --- 系統狀態與開關 ---
 enum AppState {
-  STATE_FACE,      // 待機表情模式
-  STATE_MENU,      // 選單模式
-  STATE_SYS_INFO   // 系統狀態詳情頁
+  STATE_FACE,
+  STATE_MENU,
+  STATE_SYS_INFO
 };
 
 AppState appState = STATE_FACE;
@@ -38,38 +237,34 @@ AppState appState = STATE_FACE;
 int menuIndex = 0;
 const int MENU_COUNT = 3;
 unsigned long menuTimeout = 0;
-const unsigned long MENU_IDLE_TIMEOUT = 6000; // 6 秒無操作自動返回待機畫面
+const unsigned long MENU_IDLE_TIMEOUT = 6000;
 
 bool soundEnabled = false; // 音量開關 (預設關閉)
 bool bleEnabled   = false; // 藍牙開關 (預設關閉)
 
 // --- Mochi 情緒列舉 ---
 enum MochiMood {
-  MOOD_DEFAULT,    // 呆萌正常 (自然眨眼 + 重力視線跟隨)
-  MOOD_SCRIBBLING, // 振筆疾書 (LM Studio 模型運算忙碌中)
-  MOOD_HAPPY,      // 開心微笑 (彎彎笑眼 + 歡呼)
-  MOOD_ANGRY,      // 生氣皺眉 (斜角怒視 + 警告音)
-  MOOD_SURPRISED,  // 驚訝大眼 (圓滾滾瞳孔 + 驚呼)
-  MOOD_DIZZY,      // 暈頭轉向 (X X 雙眼 + 暈眩音)
-  MOOD_SLEEPY,     // 想睡瞇眼 (平線半閉 + Zzz 飄動)
+  MOOD_DEFAULT,
+  MOOD_SCRIBBLING, // 振筆疾書 (LM Studio 運算中)
+  MOOD_HAPPY,      // 開心微笑
+  MOOD_ANGRY,      // 生氣皺眉
+  MOOD_SURPRISED,  // 驚訝大眼
+  MOOD_DIZZY,      // 暈頭轉向
+  MOOD_SLEEPY,     // 想睡瞇眼
   MOOD_COUNT
 };
 
 MochiMood currentMood = MOOD_DEFAULT;
-
-// 暫時性情緒
 MochiMood tempMood = MOOD_DEFAULT;
 unsigned long tempMoodUntil = 0;
 
-// --- 電量偵測變數 ---
 int batteryPercent = 85;
 unsigned long lastBatteryCheck = 0;
 const unsigned long BATTERY_INTERVAL = 3000;
 
-// --- MPU6050 變數與門檻值 ---
+// MPU6050
 uint8_t mpuAddr = 0x69;
 bool mpuReady = false;
-
 int16_t ax = 0, ay = 0, az = 0;
 int16_t gx = 0, gy = 0, gz = 0;
 int16_t lastAx = 0, lastAy = 0, lastAz = 0;
@@ -82,7 +277,7 @@ unsigned long lastMotionTime = 0;
 const unsigned long SLEEP_TIMEOUT = 15000;
 bool isAsleep = false;
 
-// --- 動態眼睛參數 ---
+// 眼睛參數
 const int EYE_LEFT_X = 38;
 const int EYE_RIGHT_X = 90;
 const int EYE_DEFAULT_Y = 32;
@@ -96,7 +291,6 @@ int curGazeY = 0;
 int targetGazeX = 0;
 int targetGazeY = 0;
 
-// 自然眨眼
 unsigned long lastBlinkTime = 0;
 unsigned long blinkInterval = 3000;
 bool isBlinking = false;
@@ -104,18 +298,32 @@ int blinkStage = 0;
 
 int animFrame = 0;
 
-// --- 電池電量讀取函式 ---
+// --- 藍牙開關實體控制函式 ---
+void setBlePower(bool enable) {
+  if (enable) {
+    if (!bleHardwareReady) {
+      if (ble.begin(false)) {
+        bleHardwareReady = true;
+        ble.sendCommandCheckOK(F("AT+GAPDEVNAME=Mochi-Robot"));
+      }
+    }
+  } else {
+    // 關閉廣播節能
+    if (bleHardwareReady) {
+      ble.sendCommandCheckOK(F("AT+GAPSTOPADV"));
+    }
+  }
+}
+
 int readBatteryPercentage() {
   digitalWrite(BATTERY_POWER, HIGH);
   delayMicroseconds(300);
   int raw = analogRead(BATTERY_READ);
   digitalWrite(BATTERY_POWER, LOW);
-
   int pct = map(raw, 530, 630, 0, 100);
   return constrain(pct, 0, 100);
 }
 
-// --- 8-Bit 萌系音效輔助 ---
 void sndTick() {
   if (!soundEnabled) return;
   tone(BUZZER, 2200, 10);
@@ -174,7 +382,6 @@ void sndWake() {
   noTone(BUZZER);
 }
 
-// --- MPU6050 初始化與讀取 ---
 void initMPU6050() {
   Wire.begin();
   Wire.setWireTimeout(3000, true);
@@ -214,194 +421,171 @@ void readMPU6050() {
   }
 }
 
-// --- 繪製外圈電量框 ---
 void drawBatteryRing(int pct) {
   if (pct < 15 && (animFrame % 20 < 10)) return;
 
   int armLen = map(pct, 0, 100, 4, 192);
 
   int topR = min(armLen, 64);
-  display.drawFastHLine(64, 0, topR, SSD1306_WHITE);
+  drawFastHLine(64, 0, topR, 1);
   if (armLen > 64) {
     int sideR = min(armLen - 64, 64);
-    display.drawFastVLine(127, 0, sideR, SSD1306_WHITE);
+    drawFastVLine(127, 0, sideR, 1);
   }
   if (armLen > 128) {
     int botR = min(armLen - 128, 64);
-    display.drawFastHLine(127 - botR, 63, botR, SSD1306_WHITE);
+    drawFastHLine(127 - botR, 63, botR, 1);
   }
 
-  display.drawFastHLine(64 - topR, 0, topR, SSD1306_WHITE);
+  drawFastHLine(64 - topR, 0, topR, 1);
   if (armLen > 64) {
     int sideL = min(armLen - 64, 64);
-    display.drawFastVLine(0, 0, sideL, SSD1306_WHITE);
+    drawFastVLine(0, 0, sideL, 1);
   }
   if (armLen > 128) {
     int botL = min(armLen - 128, 64);
-    display.drawFastHLine(0, 63, botL, SSD1306_WHITE);
+    drawFastHLine(0, 63, botL, 1);
   }
 }
-
-// --- 繪製各種表情 ---
 
 // 1. 一般圓角方形眼睛
 void drawNormalEyes(int lx, int rx, int y, int w, int h) {
   int r = min(8, h / 2);
   if (h <= 4) {
-    display.fillRoundRect(lx - w / 2, y - 1, w, 3, 1, SSD1306_WHITE);
-    display.fillRoundRect(rx - w / 2, y - 1, w, 3, 1, SSD1306_WHITE);
+    fillRoundRect(lx - w / 2, y - 1, w, 3, 1, 1);
+    fillRoundRect(rx - w / 2, y - 1, w, 3, 1, 1);
   } else {
-    display.fillRoundRect(lx - w / 2, y - h / 2, w, h, r, SSD1306_WHITE);
-    display.fillRoundRect(rx - w / 2, y - h / 2, w, h, r, SSD1306_WHITE);
+    fillRoundRect(lx - w / 2, y - h / 2, w, h, r, 1);
+    fillRoundRect(rx - w / 2, y - h / 2, w, h, r, 1);
 
     int pupilOffsetX = constrain(curGazeX * 4 / 10, -4, 4);
     int pupilOffsetY = constrain(curGazeY * 4 / 10, -3, 3);
-    display.fillCircle(lx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, SSD1306_BLACK);
-    display.fillCircle(rx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, SSD1306_BLACK);
+    fillCircle(lx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, 0);
+    fillCircle(rx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, 0);
   }
 }
 
-// 2. 振筆疾書 (LM Studio 運算中專注狂寫)
+// 2. 振筆疾書 (LM Studio 運算專注狂寫)
 void drawScribblingEyes(int lx, int rx, int y, int frame) {
-  // 認真微瞇眼
-  display.fillRoundRect(lx - 13, y - 12, 26, 22, 5, SSD1306_WHITE);
-  display.fillRoundRect(rx - 13, y - 12, 26, 22, 5, SSD1306_WHITE);
-  // 嚴肅內壓眉
-  display.fillTriangle(lx - 13, y - 13, lx + 13, y - 13, lx + 13, y - 4, SSD1306_BLACK);
-  display.fillTriangle(rx - 13, y - 13, rx + 13, y - 13, rx - 13, y - 4, SSD1306_BLACK);
+  fillRoundRect(lx - 13, y - 12, 26, 22, 5, 1);
+  fillRoundRect(rx - 13, y - 12, 26, 22, 5, 1);
 
-  // 瞳孔飛速左右掃描
-  int scanX = ((frame * 3) % 16) - 8;
-  display.fillCircle(lx + scanX, y + 2, 4, SSD1306_BLACK);
-  display.fillCircle(rx + scanX, y + 2, 4, SSD1306_BLACK);
-
-  // 額頭汗珠
-  if (frame % 8 < 4) {
-    display.fillCircle(112, 16, 2, SSD1306_WHITE);
-    display.drawPixel(112, 13, SSD1306_WHITE);
+  // 斜眉
+  for (int r = 0; r < 8; r++) {
+    drawFastHLine(lx - 13, y - 12 + r, 26 - r * 2, 0);
+    drawFastHLine(rx - 13 + r * 2, y - 12 + r, 26 - r * 2, 0);
   }
 
-  // 底部：瘋狂書寫折線與筆尖動態
+  // 瞳孔飛速掃視
+  int scanX = ((frame * 3) % 16) - 8;
+  fillCircle(lx + scanX, y + 2, 4, 0);
+  fillCircle(rx + scanX, y + 2, 4, 0);
+
+  // 汗滴
+  if (frame % 8 < 4) {
+    fillCircle(112, 16, 2, 1);
+    drawPixel(112, 13, 1);
+  }
+
+  // 底部書寫折線與筆尖
   int penX = 22 + ((frame * 5) % 84);
   int penY = 56 + ((frame % 2 == 0) ? -1 : 1);
   for (int i = 20; i < penX; i += 6) {
     int w = ((i / 6) % 2 == 0) ? -2 : 2;
-    display.drawLine(i, 56 + w, i + 6, 56 - w, SSD1306_WHITE);
+    drawLine(i, 56 + w, i + 6, 56 - w, 1);
   }
-  // 筆尖
-  display.drawLine(penX, penY, penX + 4, penY - 6, SSD1306_WHITE);
-  display.drawLine(penX + 1, penY, penX + 5, penY - 6, SSD1306_WHITE);
+  drawLine(penX, penY, penX + 4, penY - 6, 1);
+  drawLine(penX + 1, penY, penX + 5, penY - 6, 1);
 }
 
 // 3. 開心微笑月牙眼 (^ ^)
 void drawHappyEyes(int lx, int rx, int y, int bounce) {
   int cy = y + bounce;
-  display.fillRoundRect(lx - 14, cy - 8, 28, 20, 8, SSD1306_WHITE);
-  display.fillRoundRect(lx - 16, cy - 2, 32, 22, 6, SSD1306_BLACK);
-  display.fillRoundRect(rx - 14, cy - 8, 28, 20, 8, SSD1306_WHITE);
-  display.fillRoundRect(rx - 16, cy - 2, 32, 22, 6, SSD1306_BLACK);
+  fillRoundRect(lx - 14, cy - 8, 28, 20, 8, 1);
+  fillRoundRect(lx - 16, cy - 2, 32, 22, 6, 0);
+  fillRoundRect(rx - 14, cy - 8, 28, 20, 8, 1);
+  fillRoundRect(rx - 16, cy - 2, 32, 22, 6, 0);
 }
 
 // 4. 生氣斜眉眼 (> <)
 void drawAngryEyes(int lx, int rx, int y, int w, int h) {
   int r = 6;
-  display.fillRoundRect(lx - w / 2, y - h / 2, w, h, r, SSD1306_WHITE);
-  display.fillRoundRect(rx - w / 2, y - h / 2, w, h, r, SSD1306_WHITE);
-  display.fillTriangle(lx - w / 2, y - h / 2 - 1, lx + w / 2 + 1, y - h / 2 - 1, lx + w / 2 + 1, y + 2, SSD1306_BLACK);
-  display.fillTriangle(rx - w / 2 - 1, y - h / 2 - 1, rx + w / 2, y - h / 2 - 1, rx - w / 2 - 1, y + 2, SSD1306_BLACK);
+  fillRoundRect(lx - w / 2, y - h / 2, w, h, r, 1);
+  fillRoundRect(rx - w / 2, y - h / 2, w, h, r, 1);
+  for (int row = 0; row < 10; row++) {
+    drawFastHLine(lx - w / 2, y - h / 2 + row, w - row * 2, 0);
+    drawFastHLine(rx - w / 2 + row * 2, y - h / 2 + row, w - row * 2, 0);
+  }
 }
 
 // 5. 驚訝大圓眼 (O O)
 void drawSurprisedEyes(int lx, int rx, int y, int gx, int gy) {
-  display.fillCircle(lx, y, 18, SSD1306_WHITE);
-  display.fillCircle(rx, y, 18, SSD1306_WHITE);
-  display.fillCircle(lx + gx, y + gy, 7, SSD1306_BLACK);
-  display.fillCircle(rx + gx, y + gy, 7, SSD1306_BLACK);
-  display.fillCircle(lx + gx + 3, y + gy - 3, 2, SSD1306_WHITE);
-  display.fillCircle(rx + gx + 3, y + gy - 3, 2, SSD1306_WHITE);
+  fillCircle(lx, y, 18, 1);
+  fillCircle(rx, y, 18, 1);
+  fillCircle(lx + gx, y + gy, 7, 0);
+  fillCircle(rx + gx, y + gy, 7, 0);
+  fillCircle(lx + gx + 3, y + gy - 3, 2, 1);
+  fillCircle(rx + gx + 3, y + gy - 3, 2, 1);
 }
 
 // 6. 暈眩叉叉眼 (X X)
 void drawDizzyEyes(int lx, int rx, int y) {
   for (int i = -1; i <= 1; i++) {
-    display.drawLine(lx - 12, y - 12 + i, lx + 12, y + 12 + i, SSD1306_WHITE);
-    display.drawLine(lx - 12, y + 12 + i, lx + 12, y - 12 + i, SSD1306_WHITE);
-    display.drawLine(rx - 12, y - 12 + i, rx + 12, y + 12 + i, SSD1306_WHITE);
-    display.drawLine(rx - 12, y + 12 + i, rx + 12, y - 12 + i, SSD1306_WHITE);
+    drawLine(lx - 12, y - 12 + i, lx + 12, y + 12 + i, 1);
+    drawLine(lx - 12, y + 12 + i, lx + 12, y - 12 + i, 1);
+    drawLine(rx - 12, y - 12 + i, rx + 12, y + 12 + i, 1);
+    drawLine(rx - 12, y + 12 + i, rx + 12, y - 12 + i, 1);
   }
 }
 
 // 7. 想睡瞇瞇眼 (- -)
 void drawSleepyEyes(int lx, int rx, int y, int frame) {
-  display.fillRoundRect(lx - 13, y + 4, 26, 6, 2, SSD1306_WHITE);
-  display.fillRoundRect(rx - 13, y + 4, 26, 6, 2, SSD1306_WHITE);
+  fillRoundRect(lx - 13, y + 4, 26, 6, 2, 1);
+  fillRoundRect(rx - 13, y + 4, 26, 6, 2, 1);
 
   int zOffset = (frame % 30);
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(105, 20 - (zOffset / 2));
-  display.print(F("z"));
+  drawText_P(105, 20 - (zOffset / 2), PSTR("z"), 1);
   if (zOffset > 10) {
-    display.setCursor(112, 14 - (zOffset / 2));
-    display.print(F("Z"));
+    drawText_P(112, 14 - (zOffset / 2), PSTR("Z"), 1);
   }
 }
 
 // --- 繪製選單 (MENU) 畫面 ---
 void drawMenuScreen() {
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(42, 4);
-  display.print(F("== MENU =="));
-  display.drawFastHLine(6, 14, 116, SSD1306_WHITE);
+  drawText_P(36, 4, PSTR("== MENU =="), 1);
+  drawFastHLine(6, 14, 116, 1);
 
-  // 選項 0: 系統狀態
-  if (menuIndex == 0) display.fillRect(6, 17, 116, 12, SSD1306_WHITE);
-  display.setTextColor(menuIndex == 0 ? SSD1306_BLACK : SSD1306_WHITE);
-  display.setCursor(10, 19);
-  display.print(F("1. SYSTEM STATUS >"));
+  if (menuIndex == 0) fillRect(6, 17, 116, 12, 1);
+  drawText_P(10, 19, PSTR("1. SYSTEM STATUS >"), menuIndex == 0 ? 0 : 1);
 
-  // 選項 1: 藍牙開關
-  if (menuIndex == 1) display.fillRect(6, 31, 116, 12, SSD1306_WHITE);
-  display.setTextColor(menuIndex == 1 ? SSD1306_BLACK : SSD1306_WHITE);
-  display.setCursor(10, 33);
-  display.print(F("2. BLE     : "));
-  display.print(bleEnabled ? F("[ON]") : F("[OFF]"));
+  if (menuIndex == 1) fillRect(6, 31, 116, 12, 1);
+  drawText_P(10, 33, PSTR("2. BLE     : "), menuIndex == 1 ? 0 : 1);
+  drawText_P(82, 33, bleEnabled ? PSTR("[ON]") : PSTR("[OFF]"), menuIndex == 1 ? 0 : 1);
 
-  // 選項 2: 音量開關
-  if (menuIndex == 2) display.fillRect(6, 45, 116, 12, SSD1306_WHITE);
-  display.setTextColor(menuIndex == 2 ? SSD1306_BLACK : SSD1306_WHITE);
-  display.setCursor(10, 47);
-  display.print(F("3. SOUND   : "));
-  display.print(soundEnabled ? F("[ON]") : F("[OFF]"));
+  if (menuIndex == 2) fillRect(6, 45, 116, 12, 1);
+  drawText_P(10, 47, PSTR("3. SOUND   : "), menuIndex == 2 ? 0 : 1);
+  drawText_P(82, 47, soundEnabled ? PSTR("[ON]") : PSTR("[OFF]"), menuIndex == 2 ? 0 : 1);
 
-  display.drawFastHLine(6, 59, 116, SSD1306_WHITE);
+  drawFastHLine(6, 59, 116, 1);
 }
 
 // --- 繪製系統狀態 (SYSTEM STATUS) 詳情頁 ---
 void drawSysInfoScreen() {
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(24, 3);
-  display.print(F("SYSTEM STATUS"));
-  display.drawFastHLine(6, 13, 116, SSD1306_WHITE);
+  drawText_P(22, 3, PSTR("SYSTEM STATUS"), 1);
+  drawFastHLine(6, 13, 116, 1);
 
-  display.setCursor(8, 17);
-  display.print(F("BATTERY: "));
-  display.print(batteryPercent);
-  display.print(F("%"));
+  drawText_P(8, 17, PSTR("BATTERY: "), 1);
+  drawNum(62, 17, batteryPercent, 1);
+  drawText_P(86, 17, PSTR("%"), 1);
 
-  display.setCursor(8, 28);
-  display.print(F("POWER  : "));
-  display.print(digitalRead(CHARGE_STATUS) == LOW ? F("CHARGING") : F("DISCHARGE"));
+  drawText_P(8, 28, PSTR("POWER  : "), 1);
+  drawText_P(62, 28, digitalRead(CHARGE_STATUS) == LOW ? PSTR("CHARGING") : PSTR("BATTERY"), 1);
 
-  display.setCursor(8, 39);
-  display.print(F("MPU6050: "));
-  display.print(mpuReady ? F("ONLINE OK") : F("FAILED"));
+  drawText_P(8, 39, PSTR("MPU6050: "), 1);
+  drawText_P(62, 39, mpuReady ? PSTR("ONLINE OK") : PSTR("FAILED"), 1);
 
-  display.setCursor(8, 50);
-  display.print(F("BLE    : "));
-  display.print(bleEnabled ? F("ACTIVE") : F("OFF"));
+  drawText_P(8, 50, PSTR("BLE    : "), 1);
+  drawText_P(62, 50, bleEnabled ? PSTR("BROADCASTING") : PSTR("OFF"), 1);
 }
 
 void setup() {
@@ -419,25 +603,18 @@ void setup() {
   pinMode(BATTERY_POWER, OUTPUT);
   digitalWrite(BATTERY_POWER, LOW);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
-    while (1);
-  }
-
+  oled_init();
   initMPU6050();
 
   batteryPercent = readBatteryPercentage();
 
-  display.clearDisplay();
+  clearDisplay();
   drawBatteryRing(batteryPercent);
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(30, 22);
-  display.println(F("DASAI MOCHI"));
-  display.setCursor(38, 36);
-  display.print(F("BAT: "));
-  display.print(batteryPercent);
-  display.println(F("%"));
-  display.display();
+  drawText_P(30, 22, PSTR("DASAI MOCHI"), 1);
+  drawText_P(36, 36, PSTR("BAT: "), 1);
+  drawNum(66, 36, batteryPercent, 1);
+  drawText_P(90, 36, PSTR("%"), 1);
+  oled_display();
 
   sndHappy();
   delay(600);
@@ -448,14 +625,45 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 定期更新電量讀數
+  // 定期更新電量
   if (now - lastBatteryCheck > BATTERY_INTERVAL) {
     lastBatteryCheck = now;
     int curPct = readBatteryPercentage();
     batteryPercent = (batteryPercent * 3 + curPct) / 4;
   }
 
-  // --- 1. 讀取六軸感測器 ---
+  // --- 藍牙數據接收監聽 (真實硬體監聽) ---
+  if (bleEnabled && bleHardwareReady) {
+    while (ble.available()) {
+      char c = ble.read();
+      if (c == 'B' || c == 'b') {
+        // 'B' = Busy (LM Studio 運算中 -> 振筆疾書)
+        currentMood = MOOD_SCRIBBLING;
+        tempMoodUntil = 0;
+        isAsleep = false;
+        lastMotionTime = now;
+        appState = STATE_FACE;
+      } else if (c == 'D' || c == 'd') {
+        // 'D' = Done (LM Studio 完成 -> 得意笑臉 + 叮一聲)
+        currentMood = MOOD_HAPPY;
+        tempMoodUntil = now + 4000;
+        isAsleep = false;
+        lastMotionTime = now;
+        appState = STATE_FACE;
+        sndHappy();
+      } else if (c == 'I' || c == 'i') {
+        // 'I' = Idle (回復呆萌待機)
+        currentMood = MOOD_DEFAULT;
+        tempMoodUntil = 0;
+        appState = STATE_FACE;
+      } else if (c == 'S' || c == 's') {
+        // 'S' = Sleep (打瞌睡)
+        isAsleep = true;
+      }
+    }
+  }
+
+  // 六軸感測器讀取
   readMPU6050();
 
   long dAx = (long)ax - lastAx;
@@ -474,8 +682,8 @@ void loop() {
   lastAy = ay;
   lastAz = az;
 
-  // --- 2. 實體動作觸發事件 (僅在待機表情模式有效) ---
-  if (appState == STATE_FACE) {
+  // 實體動作觸發事件
+  if (appState == STATE_FACE && currentMood != MOOD_SCRIBBLING) {
     if (shakeEnergy > SHAKE_THRESHOLD) {
       shakeEnergy = 0;
       tempMood = MOOD_DIZZY;
@@ -505,7 +713,7 @@ void loop() {
     }
   }
 
-  // --- 3. 重力傾斜視線跟隨 ---
+  // 重力傾斜視線跟隨
   if (appState == STATE_FACE && !isAsleep && tempMoodUntil < now && currentMood == MOOD_DEFAULT) {
     int tiltH = -((long)ay / 550);
     if (abs(ax) > abs(ay) * 4 / 3) {
@@ -526,7 +734,7 @@ void loop() {
   curGazeX = (curGazeX * 65 + targetGazeX * 35) / 100;
   curGazeY = (curGazeY * 65 + targetGazeY * 35) / 100;
 
-  // --- 4. 按鈕狀態與選單機制 ---
+  // 按鈕狀態處理
   static bool lastSw1 = HIGH;
   static bool lastSw2 = HIGH;
   static bool lastSw3 = HIGH;
@@ -535,38 +743,34 @@ void loop() {
   bool sw2 = digitalRead(SW2);
   bool sw3 = digitalRead(SW3);
 
-  // 選單逾時自動返回待機畫面
+  // 選單逾時返回待機
   if ((appState == STATE_MENU || appState == STATE_SYS_INFO) && (now > menuTimeout)) {
     appState = STATE_FACE;
   }
 
-  // --- 按鍵 1 (SW1): 進入選單 / 確認 / True-False 切換 ---
+  // 按鍵 1 (SW1): 進入選單 / 確認 / 切換
   if (lastSw1 == HIGH && sw1 == LOW) {
     lastMotionTime = now;
     if (appState == STATE_FACE) {
-      // 待機畫面下：按 SW1 進入選單
       appState = STATE_MENU;
       menuIndex = 0;
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
     } else if (appState == STATE_MENU) {
-      // 選單內：按 SW1 進行 True/False 切換或進入狀態頁
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       if (menuIndex == 0) {
-        // 進入系統狀態頁
         appState = STATE_SYS_INFO;
         sndTick();
       } else if (menuIndex == 1) {
-        // 藍牙開關切換
+        // 真實控制藍牙硬體晶片！
         bleEnabled = !bleEnabled;
+        setBlePower(bleEnabled);
         if (bleEnabled) sndHappy(); else sndTick();
       } else if (menuIndex == 2) {
-        // 音量開關切換
         soundEnabled = !soundEnabled;
         if (soundEnabled) sndHappy(); else sndTick();
       }
     } else if (appState == STATE_SYS_INFO) {
-      // 系統狀態頁下按 SW1 返回選單
       appState = STATE_MENU;
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
@@ -574,11 +778,10 @@ void loop() {
     delay(40);
   }
 
-  // --- 按鍵 2 (SW2): 選單中為「上」，待機中為「戳一下」 ---
+  // 按鍵 2 (SW2): 選單中為「上」，待機中為「戳一下」
   if (lastSw2 == HIGH && sw2 == LOW) {
     lastMotionTime = now;
     if (appState == STATE_MENU) {
-      // 選單內：向上切換選項
       menuIndex = (menuIndex + MENU_COUNT - 1) % MENU_COUNT;
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
@@ -587,21 +790,17 @@ void loop() {
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
     } else {
-      // 待機時戳一下 (摸頭)
       isAsleep = false;
       tempMoodUntil = 0;
       sndPoke();
       digitalWrite(LED_LEFT, HIGH);
       digitalWrite(LED_RIGHT, HIGH);
-      display.clearDisplay();
+      clearDisplay();
       drawBatteryRing(batteryPercent);
       drawHappyEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, -4);
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(54, 6);
-      display.print(batteryPercent);
-      display.print(F("%"));
-      display.display();
+      drawNum(52, 6, batteryPercent, 1);
+      drawText_P(70, 6, PSTR("%"), 1);
+      oled_display();
       delay(400);
       digitalWrite(LED_LEFT, (currentMood == MOOD_HAPPY) ? HIGH : LOW);
       digitalWrite(LED_RIGHT, (currentMood == MOOD_HAPPY) ? HIGH : LOW);
@@ -609,11 +808,10 @@ void loop() {
     delay(40);
   }
 
-  // --- 按鍵 3 (SW3): 選單中為「下」，待機中為「手動切換表情」 ---
+  // 按鍵 3 (SW3): 選單中為「下」，待機中為手動切換表情
   if (lastSw3 == HIGH && sw3 == LOW) {
     lastMotionTime = now;
     if (appState == STATE_MENU) {
-      // 選單內：向下切換選項
       menuIndex = (menuIndex + 1) % MENU_COUNT;
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
@@ -622,7 +820,6 @@ void loop() {
       menuTimeout = now + MENU_IDLE_TIMEOUT;
       sndTick();
     } else {
-      // 待機時手動循環表情
       tempMoodUntil = 0;
       isAsleep = false;
       currentMood = (MochiMood)((currentMood + 1) % MOOD_COUNT);
@@ -646,7 +843,6 @@ void loop() {
   lastSw2 = sw2;
   lastSw3 = sw3;
 
-  // --- 5. 決定活躍表情 (待機狀態下) ---
   static MochiMood lastActiveMood = MOOD_DEFAULT;
   MochiMood activeMood = currentMood;
   if (tempMoodUntil > now) {
@@ -661,7 +857,7 @@ void loop() {
   }
   lastActiveMood = activeMood;
 
-  // --- 6. 自然眨眼邏輯 ---
+  // 自然眨眼
   if (appState == STATE_FACE && activeMood == MOOD_DEFAULT && !isAsleep) {
     if (!isBlinking && (now - lastBlinkTime > blinkInterval)) {
       isBlinking = true;
@@ -685,17 +881,14 @@ void loop() {
     isBlinking = false;
   }
 
-  // --- 7. 畫面渲染 ---
-  display.clearDisplay();
+  // 畫面渲染
+  clearDisplay();
 
   if (appState == STATE_MENU) {
-    // 渲染選單介面
     drawMenuScreen();
   } else if (appState == STATE_SYS_INFO) {
-    // 渲染系統狀態詳情
     drawSysInfoScreen();
   } else {
-    // 渲染待機表情畫面
     drawBatteryRing(batteryPercent);
 
     int lx = EYE_LEFT_X + curGazeX;
@@ -751,7 +944,7 @@ void loop() {
     }
   }
 
-  display.display();
+  oled_display();
 
   animFrame++;
   delay(35);
