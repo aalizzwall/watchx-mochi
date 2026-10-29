@@ -1,0 +1,14 @@
+# Arduino / build artifacts
+.arduino15/
+.arduino_user/
+build/
+*.hex
+*.elf
+*.bin
+*.o
+*.a
+*.swp
+
+# OS artifacts
+.DS_Store
+Thumbs.db
