@@ -96,23 +96,14 @@ int animFrame = 0;
 
 // --- 電池電量讀取函式 ---
 int readBatteryPercentage() {
-  pinMode(BATTERY_POWER, OUTPUT);
   digitalWrite(BATTERY_POWER, HIGH);
-  delayMicroseconds(250);
+  delayMicroseconds(300);
   int raw = analogRead(BATTERY_READ);
   digitalWrite(BATTERY_POWER, LOW);
 
   // watchX 分壓讀值：530 代表約 3.4V (0%), 630 代表約 4.2V (100%)
   int pct = map(raw, 530, 630, 0, 100);
-  pct = constrain(pct, 0, 100);
-
-  Serial.print(F("[POWER] Raw: "));
-  Serial.print(raw);
-  Serial.print(F(" -> Battery: "));
-  Serial.print(pct);
-  Serial.println(F("%"));
-
-  return pct;
+  return constrain(pct, 0, 100);
 }
 
 // --- 8-Bit 萌系音效 ---
@@ -179,6 +170,9 @@ void sndSleep() {
 // --- MPU6050 初始化與讀取 ---
 void initMPU6050() {
   Wire.begin();
+  // 啟用 I2C 逾時防卡死機制 (3000 微秒超時自動重置匯流排)
+  Wire.setWireTimeout(3000, true);
+
   // 檢測 I2C 地址 (0x69 優先，失敗則嘗試 0x68)
   Wire.beginTransmission(0x69);
   if (Wire.endTransmission() != 0) {
@@ -336,8 +330,6 @@ void drawSleepyEyes(int lx, int rx, int y, int frame) {
 }
 
 void setup() {
-  Serial.begin(115200);
-
   pinMode(SW1, INPUT_PULLUP);
   pinMode(SW2, INPUT_PULLUP);
   pinMode(SW3, INPUT_PULLUP);
@@ -349,6 +341,8 @@ void setup() {
 
   pinMode(BUZZER, OUTPUT);
   pinMode(CHARGE_STATUS, INPUT_PULLUP);
+  pinMode(BATTERY_POWER, OUTPUT);
+  digitalWrite(BATTERY_POWER, LOW);
 
   // 初始化 OLED (SPI 介面)
   if (!display.begin(SSD1306_SWITCHCAPVCC)) {

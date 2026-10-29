@@ -65,3 +65,4 @@ arduino-cli compile --fqbn arduino:avr:leonardo watchx_mochi
 # 燒錄進 watchX (連接埠依系統而異，Mac 通常為 /dev/cu.usbmodem*)
 arduino-cli upload -p /dev/cu.usbmodem2101 --fqbn arduino:avr:leonardo watchx_mochi
 ```
+
