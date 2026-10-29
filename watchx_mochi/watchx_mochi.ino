@@ -60,11 +60,19 @@ void fillRect(int x, int y, int w, int h, uint8_t color) {
 }
 
 void fillRoundRect(int x, int y, int w, int h, int r, uint8_t color) {
-  fillRect(x + r, y, w - 2 * r, h, color);
-  for (int i = 0; i <= r; i++) {
-    int dx = r - (int)sqrt((long)r * r - (long)(r - i) * (r - i));
-    drawFastHLine(x + dx, y + i, w - 2 * dx, color);
-    drawFastHLine(x + dx, y + h - 1 - i, w - 2 * dx, color);
+  if (r <= 0) { fillRect(x, y, w, h, color); return; }
+  if (r > w / 2) r = w / 2;
+  if (r > h / 2) r = h / 2;
+
+  // 1. 中間整段主幹：寬度全寬 w，高度從 y+r 到 y+h-r
+  fillRect(x, y + r, w, h - 2 * r, color);
+
+  // 2. 頂部與底部圓角段：弧線平滑向外延伸對齊，圓潤無凹陷
+  for (int i = 0; i < r; i++) {
+    int dy = r - i;
+    int dx = (int)(sqrt((float)(r * r - dy * dy)) + 0.5f);
+    drawFastHLine(x + r - dx, y + i, w - 2 * r + 2 * dx, color);
+    drawFastHLine(x + r - dx, y + h - 1 - i, w - 2 * r + 2 * dx, color);
   }
 }
 
@@ -240,7 +248,7 @@ unsigned long menuTimeout = 0;
 const unsigned long MENU_IDLE_TIMEOUT = 6000;
 
 bool soundEnabled = false; // 音量開關 (預設關閉)
-bool bleEnabled   = false; // 藍牙開關 (預設關閉)
+bool bleEnabled   = true;  // 藍牙開關 (預設開啟，便於隨時連線)
 
 // --- Mochi 情緒列舉 ---
 enum MochiMood {
@@ -304,8 +312,17 @@ void setBlePower(bool enable) {
     if (!bleHardwareReady) {
       if (ble.begin(false)) {
         bleHardwareReady = true;
+        ble.echo(false);
+        ble.verbose(false);
+        // 設定名稱並立即軟體重啟使新廣播名生效
         ble.sendCommandCheckOK(F("AT+GAPDEVNAME=Mochi-Robot"));
+        ble.reset();
+        delay(400);
+        ble.setMode(BLUEFRUIT_MODE_DATA);
       }
+    } else {
+      ble.sendCommandCheckOK(F("AT+GAPSTARTADV"));
+      ble.setMode(BLUEFRUIT_MODE_DATA);
     }
   } else {
     // 關閉廣播節能
@@ -448,7 +465,7 @@ void drawBatteryRing(int pct) {
   }
 }
 
-// 1. 一般圓角方形眼睛
+// 1. 一般圓角方形大眼 (純淨飽滿呆萌原創造型)
 void drawNormalEyes(int lx, int rx, int y, int w, int h) {
   int r = min(8, h / 2);
   if (h <= 4) {
@@ -457,11 +474,6 @@ void drawNormalEyes(int lx, int rx, int y, int w, int h) {
   } else {
     fillRoundRect(lx - w / 2, y - h / 2, w, h, r, 1);
     fillRoundRect(rx - w / 2, y - h / 2, w, h, r, 1);
-
-    int pupilOffsetX = constrain(curGazeX * 4 / 10, -4, 4);
-    int pupilOffsetY = constrain(curGazeY * 4 / 10, -3, 3);
-    fillCircle(lx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, 0);
-    fillCircle(rx + pupilOffsetX + 4, y + pupilOffsetY - 5, 2, 0);
   }
 }
 
@@ -585,10 +597,19 @@ void drawSysInfoScreen() {
   drawText_P(62, 39, mpuReady ? PSTR("ONLINE OK") : PSTR("FAILED"), 1);
 
   drawText_P(8, 50, PSTR("BLE    : "), 1);
-  drawText_P(62, 50, bleEnabled ? PSTR("BROADCASTING") : PSTR("OFF"), 1);
+  if (!bleEnabled) {
+    drawText_P(62, 50, PSTR("OFF"), 1);
+  } else if (bleHardwareReady) {
+    drawText_P(62, 50, PSTR("Mochi-Robot"), 1);
+  } else {
+    drawText_P(62, 50, PSTR("HW FAILED"), 1);
+  }
 }
 
 void setup() {
+  pinMode(BLE_CS, OUTPUT);
+  digitalWrite(BLE_CS, HIGH); // 先拉高 BLE CS 避免開機時 SPI 匯流排衝突
+
   pinMode(SW1, INPUT_PULLUP);
   pinMode(SW2, INPUT_PULLUP);
   pinMode(SW3, INPUT_PULLUP);
@@ -615,6 +636,11 @@ void setup() {
   drawNum(66, 36, batteryPercent, 1);
   drawText_P(90, 36, PSTR("%"), 1);
   oled_display();
+
+  // 若藍牙啟用，啟動藍牙模組並廣播
+  if (bleEnabled) {
+    setBlePower(true);
+  }
 
   sndHappy();
   delay(600);
