@@ -311,6 +311,12 @@ const int EYE_DEFAULT_Y = 32;
 const int EYE_DEFAULT_W = 26;
 const int EYE_DEFAULT_H = 34;
 
+// OLED 防烙印像素微移 (Pixel Shifting)
+int shiftX = 0;
+int shiftY = 0;
+unsigned long lastShiftTime = 0;
+const unsigned long SHIFT_INTERVAL = 45000; // 每 45 秒切換一次微小偏移
+
 int eyeH = EYE_DEFAULT_H;
 int eyeW = EYE_DEFAULT_W;
 int curGazeX = 0;
@@ -349,12 +355,7 @@ void setBlePower(bool enable) {
 }
 
 int readBatteryPercentage() {
-  digitalWrite(BATTERY_POWER, HIGH);
-  delayMicroseconds(300);
-  int raw = analogRead(BATTERY_READ);
-  digitalWrite(BATTERY_POWER, LOW);
-  int pct = map(raw, 530, 630, 0, 100);
-  return constrain(pct, 0, 100);
+  return 100;
 }
 
 void sndTick() {
@@ -454,31 +455,25 @@ void readMPU6050() {
   }
 }
 
-void drawBatteryRing(int pct) {
-  if (pct < 15 && (animFrame % 20 < 10)) return;
+// --- 桌面模式：對稱 Cyberpunk 能量邊框 ---
+void drawCyberpunkBorder() {
+  // 頂部對稱兩翼 (中央預留標籤區)
+  drawFastHLine(0, 0, 44, 1);
+  drawFastHLine(84, 0, 44, 1);
 
-  int armLen = map(pct, 0, 100, 4, 192);
+  // 左右兩側邊框
+  drawFastVLine(0, 0, 64, 1);
+  drawFastVLine(127, 0, 64, 1);
 
-  int topR = min(armLen, 64);
-  drawFastHLine(64, 0, topR, 1);
-  if (armLen > 64) {
-    int sideR = min(armLen - 64, 64);
-    drawFastVLine(127, 0, sideR, 1);
-  }
-  if (armLen > 128) {
-    int botR = min(armLen - 128, 64);
-    drawFastHLine(127 - botR, 63, botR, 1);
-  }
+  // 底部對稱兩翼
+  drawFastHLine(0, 63, 50, 1);
+  drawFastHLine(78, 63, 50, 1);
 
-  drawFastHLine(64 - topR, 0, topR, 1);
-  if (armLen > 64) {
-    int sideL = min(armLen - 64, 64);
-    drawFastVLine(0, 0, sideL, 1);
-  }
-  if (armLen > 128) {
-    int botL = min(armLen - 128, 64);
-    drawFastHLine(0, 63, botL, 1);
-  }
+  // 四角科技倒角點
+  drawPixel(2, 2, 1);
+  drawPixel(125, 2, 1);
+  drawPixel(2, 61, 1);
+  drawPixel(125, 61, 1);
 }
 
 // 1. 一般圓角方形大眼 (純淨飽滿呆萌原創造型)
@@ -602,12 +597,9 @@ void drawSysInfoScreen() {
   drawText_P(22, 3, PSTR("SYSTEM STATUS"), 1);
   drawFastHLine(6, 13, 116, 1);
 
-  drawText_P(8, 17, PSTR("BATTERY: "), 1);
-  drawNum(62, 17, batteryPercent, 1);
-  drawText_P(86, 17, PSTR("%"), 1);
+  drawText_P(8, 17, PSTR("MODE   : DESK (USB 5V)"), 1);
 
-  drawText_P(8, 28, PSTR("POWER  : "), 1);
-  drawText_P(62, 28, digitalRead(CHARGE_STATUS) == LOW ? PSTR("CHARGING") : PSTR("BATTERY"), 1);
+  drawText_P(8, 28, PSTR("BATTERY: NONE (REMOVED)"), 1);
 
   drawText_P(8, 39, PSTR("MPU6050: "), 1);
   drawText_P(62, 39, mpuReady ? PSTR("ONLINE OK") : PSTR("FAILED"), 1);
@@ -650,14 +642,12 @@ void setup() {
   digitalWrite(LED_LEFT, LOW);
   digitalWrite(LED_RIGHT, LOW);
 
-  batteryPercent = readBatteryPercentage();
+  batteryPercent = 100;
 
   clearDisplay();
-  drawBatteryRing(batteryPercent);
+  drawCyberpunkBorder();
   drawText_P(30, 22, PSTR("DASAI MOCHI"), 1);
-  drawText_P(36, 36, PSTR("BAT: "), 1);
-  drawNum(66, 36, batteryPercent, 1);
-  drawText_P(90, 36, PSTR("%"), 1);
+  drawText_P(24, 36, PSTR("DESK ROBOT 5V"), 1);
   oled_display();
 
   // 若藍牙啟用，啟動藍牙模組並廣播
@@ -666,7 +656,7 @@ void setup() {
   }
 
   sndHappy();
-  delay(400);
+  delay(500);
 
   lastMotionTime = millis();
 }
@@ -674,11 +664,13 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 定期更新電量
-  if (now - lastBatteryCheck > BATTERY_INTERVAL) {
-    lastBatteryCheck = now;
-    int curPct = readBatteryPercentage();
-    batteryPercent = (batteryPercent * 3 + curPct) / 4;
+  // OLED 防烙印像素微移 (每 45 秒微移 1 像素，保護桌面常亮壽命)
+  if (now - lastShiftTime > SHIFT_INTERVAL) {
+    lastShiftTime = now;
+    static uint8_t sPhase = 0;
+    sPhase = (sPhase + 1) % 4;
+    shiftX = (sPhase == 1) ? 1 : ((sPhase == 3) ? -1 : 0);
+    shiftY = (sPhase == 2) ? 1 : 0;
   }
 
   // --- 藍牙數據接收監聽 (當 IRQ 腳位有信號時才讀取，絕不卡死主循環) ---
@@ -845,10 +837,9 @@ void loop() {
       digitalWrite(LED_LEFT, HIGH);
       digitalWrite(LED_RIGHT, HIGH);
       clearDisplay();
-      drawBatteryRing(batteryPercent);
-      drawHappyEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, -4);
-      drawNum(52, 6, batteryPercent, 1);
-      drawText_P(70, 6, PSTR("%"), 1);
+      drawCyberpunkBorder();
+      drawHappyEyes(EYE_LEFT_X + shiftX, EYE_RIGHT_X + shiftX, EYE_DEFAULT_Y + shiftY, -4);
+      drawText_P(46, 4, PSTR("[ LOVE ]"), 1);
       oled_display();
       delay(400);
       digitalWrite(LED_LEFT, (currentMood == MOOD_HAPPY) ? HIGH : LOW);
@@ -938,11 +929,15 @@ void loop() {
   } else if (appState == STATE_SYS_INFO) {
     drawSysInfoScreen();
   } else {
-    drawBatteryRing(batteryPercent);
+    drawCyberpunkBorder();
 
-    int lx = EYE_LEFT_X + curGazeX;
-    int rx = EYE_RIGHT_X + curGazeX;
-    int y  = EYE_DEFAULT_Y + curGazeY;
+    int baseX  = EYE_LEFT_X + shiftX;
+    int baseXR = EYE_RIGHT_X + shiftX;
+    int baseY  = EYE_DEFAULT_Y + shiftY;
+
+    int lx = baseX + curGazeX;
+    int rx = baseXR + curGazeX;
+    int y  = baseY + curGazeY;
 
     switch (activeMood) {
       case MOOD_DEFAULT:
@@ -952,30 +947,30 @@ void loop() {
         break;
 
       case MOOD_SCRIBBLING:
-        drawScribblingEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, animFrame);
+        drawScribblingEyes(baseX, baseXR, baseY, animFrame);
         break;
 
       case MOOD_HAPPY: {
         int bounce = (animFrame % 10 < 5) ? -2 : 0;
-        drawHappyEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, bounce);
+        drawHappyEyes(baseX, baseXR, baseY, bounce);
         break;
       }
 
       case MOOD_ANGRY: {
         int shake = (animFrame % 4 < 2) ? -1 : 1;
-        drawAngryEyes(EYE_LEFT_X + shake, EYE_RIGHT_X + shake, EYE_DEFAULT_Y, eyeW, eyeH);
+        drawAngryEyes(baseX + shake, baseXR + shake, baseY, eyeW, eyeH);
         break;
       }
 
       case MOOD_SURPRISED:
         digitalWrite(LED_LEFT, LOW);
         digitalWrite(LED_RIGHT, LOW);
-        drawSurprisedEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, curGazeX, curGazeY);
+        drawSurprisedEyes(baseX, baseXR, baseY, curGazeX, curGazeY);
         break;
 
       case MOOD_DIZZY: {
         int dX = (animFrame % 6 < 3) ? -3 : 3;
-        drawDizzyEyes(EYE_LEFT_X + dX, EYE_RIGHT_X + dX, EYE_DEFAULT_Y);
+        drawDizzyEyes(baseX + dX, baseXR + dX, baseY);
         digitalWrite(LED_LEFT, (animFrame % 4 < 2) ? HIGH : LOW);
         digitalWrite(LED_RIGHT, (animFrame % 4 >= 2) ? HIGH : LOW);
         break;
@@ -984,7 +979,7 @@ void loop() {
       case MOOD_SLEEPY:
         digitalWrite(LED_LEFT, LOW);
         digitalWrite(LED_RIGHT, LOW);
-        drawSleepyEyes(EYE_LEFT_X, EYE_RIGHT_X, EYE_DEFAULT_Y, animFrame);
+        drawSleepyEyes(baseX, baseXR, baseY, animFrame);
         break;
 
       default:
