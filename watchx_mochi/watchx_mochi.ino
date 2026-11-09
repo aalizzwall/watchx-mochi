@@ -204,24 +204,42 @@ void oled_init() {
   pinMode(OLED_CS, OUTPUT);
   pinMode(OLED_DC, OUTPUT);
   pinMode(OLED_RESET, OUTPUT);
-  digitalWrite(OLED_RESET, LOW); delay(10);
+  digitalWrite(OLED_CS, HIGH);
+
+  // 硬體重置 OLED
   digitalWrite(OLED_RESET, HIGH); delay(10);
+  digitalWrite(OLED_RESET, LOW);  delay(30);
+  digitalWrite(OLED_RESET, HIGH); delay(30);
   SPI.begin();
 
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(OLED_CS, LOW);
   digitalWrite(OLED_DC, LOW);
   static const uint8_t PROGMEM initData[] = {
-    0xAE, 0x20, 0x00, 0xC8, 0x40, 0x81, 0xFF, 0xA1,
-    0xA6, 0xA8, 63,   0xD5, 0x80, 0xD9, 0xF1, 0xDA, 0x12,
-    0xDB, 0x40, 0x8D, 0x14, 0xAF
+    0xAE,             // Display OFF
+    0x20, 0x00,       // Set Memory Addressing Mode to Horizontal
+    0xC8,             // Set COM Output Scan Direction (re-map)
+    0x40,             // Set Start Line at 0
+    0x81, 0xFF,       // Set Contrast Control (max)
+    0xA1,             // Set Segment Re-map (A0/A1)
+    0xA6,             // Normal display (non-inverted)
+    0xA8, 63,         // Set Multiplex Ratio (1 to 64)
+    0xD5, 0x80,       // Set Display Clock Divide Ratio / Oscillator Frequency
+    0xD9, 0xF1,       // Set Pre-charge Period
+    0xDA, 0x12,       // Set COM Pins Hardware Configuration
+    0xDB, 0x40,       // Set VCOMH Deselect Level
+    0x8D, 0x14,       // Enable Charge Pump
+    0xAF              // Display ON
   };
   for (uint8_t i = 0; i < sizeof(initData); i++) {
     SPI.transfer(pgm_read_byte(&initData[i]));
   }
   digitalWrite(OLED_CS, HIGH);
+  SPI.endTransaction();
 }
 
 void oled_display() {
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(OLED_CS, LOW);
   digitalWrite(OLED_DC, LOW);
   SPI.transfer(0x21); SPI.transfer(0); SPI.transfer(127);
@@ -231,6 +249,7 @@ void oled_display() {
     SPI.transfer(oled_buf[i]);
   }
   digitalWrite(OLED_CS, HIGH);
+  SPI.endTransaction();
 }
 
 // --- 系統狀態與開關 ---
@@ -248,7 +267,7 @@ unsigned long menuTimeout = 0;
 const unsigned long MENU_IDLE_TIMEOUT = 6000;
 
 bool soundEnabled = false; // 音量開關 (預設關閉)
-bool bleEnabled   = true;  // 藍牙開關 (預設開啟，便於隨時連線)
+bool bleEnabled   = false; // 藍牙開關 (預設關閉，按選單手動開啟)
 
 // --- Mochi 情緒列舉 ---
 enum MochiMood {
@@ -314,10 +333,7 @@ void setBlePower(bool enable) {
         bleHardwareReady = true;
         ble.echo(false);
         ble.verbose(false);
-        // 設定名稱並立即軟體重啟使新廣播名生效
         ble.sendCommandCheckOK(F("AT+GAPDEVNAME=Mochi-Robot"));
-        ble.reset();
-        delay(400);
         ble.setMode(BLUEFRUIT_MODE_DATA);
       }
     } else {
@@ -627,6 +643,13 @@ void setup() {
   oled_init();
   initMPU6050();
 
+  // 開機雙頰 LED 閃爍一次確認 MCU 正常工作
+  digitalWrite(LED_LEFT, HIGH);
+  digitalWrite(LED_RIGHT, HIGH);
+  delay(80);
+  digitalWrite(LED_LEFT, LOW);
+  digitalWrite(LED_RIGHT, LOW);
+
   batteryPercent = readBatteryPercentage();
 
   clearDisplay();
@@ -643,7 +666,7 @@ void setup() {
   }
 
   sndHappy();
-  delay(600);
+  delay(400);
 
   lastMotionTime = millis();
 }
@@ -658,8 +681,8 @@ void loop() {
     batteryPercent = (batteryPercent * 3 + curPct) / 4;
   }
 
-  // --- 藍牙數據接收監聽 (真實硬體監聽) ---
-  if (bleEnabled && bleHardwareReady) {
+  // --- 藍牙數據接收監聽 (當 IRQ 腳位有信號時才讀取，絕不卡死主循環) ---
+  if (bleEnabled && bleHardwareReady && digitalRead(BLE_IRQ)) {
     while (ble.available()) {
       char c = ble.read();
       if (c == 'B' || c == 'b') {
